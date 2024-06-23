@@ -105,26 +105,22 @@ class ModelHandler:
         self.model.train()
 
         for e in range(epoch):
-            for x in training_loader:
-                x.to(self.device)
+            for images, labels in training_loader:
+                images = images.to(self.device)
                 self.optimizer.zero_grad()
 
-                x_hat, embedding_loss = self.model(x)
+                pred_images, embedding_loss = self.model(images)
 
-                reconstruction_loss = F.mse_loss(x_hat, x)
+                reconstruction_loss = F.mse_loss(pred_images, images)
 
                 loss = reconstruction_loss + embedding_loss
-
+                print(loss.item())
                 loss.backward()
                 self.optimizer.step()
 
 
-
-
-
-
-
+'''
 vae = VQVAE(64, 64, 0.5)
 t = torch.randn(1, 3, 16, 16)
 print(vae(t).shape)
-
+'''
