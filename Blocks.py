@@ -2,14 +2,14 @@
 import torch
 from torch import nn
 
-def ResBlockBuilder(type, d_model, block_structure, scale_structure, block_multiplier):
+def ResLayerBuilder(type, d_model, block_structure, scale_structure, block_multiplier):
     layers = nn.ModuleList()
     scale_structure = [type * x for x in scale_structure]
 
     # decoder
     if type == 1:
         struct = reversed(list(enumerate(block_structure)))
-        previous_channels = d_model * block_multiplier[-1] ** len(block_multiplier)
+        previous_channels = d_model * block_multiplier[-1]
 
     #encoder
     else:
@@ -17,11 +17,15 @@ def ResBlockBuilder(type, d_model, block_structure, scale_structure, block_multi
         previous_channels = d_model
 
     for i, count in struct:
-        current_channels = d_model * (block_multiplier[i] ** (i + 1))
+        current_channels = d_model * block_multiplier[i]
         for block in range(count):
             scale = 0
             if block == count - 1:
                 scale = scale_structure[i]
+
+            # setting last decoder block output to be d_model
+            if type == 1 and i == 0 and block == count-1:
+                current_channels = d_model
 
             layers.append(ResBlock(previous_channels, current_channels, scale_type=scale))
             previous_channels = current_channels
@@ -56,7 +60,8 @@ class ResBlock(nn.Module):
             nn.SiLU(),
         )
 
-        self.sample_block = SampleBlock(in_channels, scale_type)
+        #self.sample_block = SampleBlock(in_channels, scale_type)
+        self.sample_block = SampleBlock(out_channels, scale_type)
 
         self.block2 = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
@@ -78,6 +83,14 @@ class ResBlock(nn.Module):
         self.res_sample_block = SampleBlock(in_channels, scale_type)
 
     def forward(self, x):
+        residual = x
+        x = self.block1(x)
+        x = self.block2(x)
+        x = self.block3(x)
+        x = x + self.res_out_conv(residual)
+        x = self.sample_block(x)
+        return x
+    def forward2(self, x):
         residual = x
         x = self.block1(x)
         x = self.sample_block(x)
