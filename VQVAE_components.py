@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch import nn
 from Blocks import ResLayerBuilder
@@ -45,6 +47,8 @@ class Block(nn.Module):
             x = module(x)
         return self.output_conv(x)
 
+ # https://github.com/lucidrains/vector-quantize-pytorch
+ # https://github.com/kakaobrain/rq-vae-transformer/tree/main
 
 class Quantizer(nn.Module):
     def __init__(self, num_embeddings, embeddings_dim, decay=0.9):
@@ -58,6 +62,10 @@ class Quantizer(nn.Module):
         self.register_buffer("ema_cluster_size", torch.zeros(self.num_embeddings))
         self.register_buffer("ema_input_sum_per_embedding", self.codebook.clone())
 
+        nn.init.uniform_(self.codebook, -1/self.num_embeddings, 1/self.num_embeddings)
+
+        self.cos = nn.CosineSimilarity(dim=-1, eps=1e-6)
+
     def forward(self, inputs):
         # flatten input
         flatten = inputs.view(-1, self.embeddings_dim)
@@ -68,10 +76,16 @@ class Quantizer(nn.Module):
         l2_codebook = torch.sum(self.codebook.pow(2), dim=0, keepdim=True)
 
         distances = l2_input - 2 * input_dot_codebook + l2_codebook'''
-        distances = torch.cdist(flatten, self.codebook.t(), p=2.0).pow(2)
+        distances = (
+                torch.sum(flatten ** 2, dim=1, keepdim=True)
+                - 2 * torch.matmul(flatten, self.codebook)
+                + torch.sum(self.codebook ** 2, dim=0, keepdim=True)
+        )
+
+        distances = self.distance(flatten)
 
         # finding the nearest codebook vector indices and one hot it
-        nearest_codebook_indices = torch.argmin(distances, dim=1).unsqueeze(1)
+        nearest_codebook_indices = torch.argmin(distances, dim=-1).unsqueeze(1)
         nearest_codebook_indices_one_hot = F.one_hot(nearest_codebook_indices, self.num_embeddings).squeeze(1).type(
             inputs.dtype)
 
@@ -92,13 +106,14 @@ class Quantizer(nn.Module):
 
             # adds small number eps to all clusters for no division by 0
             # normalizes cluster+eps by new total sum that includes eps
-            norm = (self.ema_cluster_size + self.eps) / (n + self.num_embeddings * self.eps)
-            # denormalizes but now there are no 0's so division works
-            cluster_size = norm * n
+            norm_cluster_size = ((self.ema_cluster_size + self.eps) / (n + self.num_embeddings * self.eps)) * n
 
             # moving codebook clusters by mean
-            input_mean_per_embedding = self.ema_input_sum_per_embedding / cluster_size.unsqueeze(0)
-            self.codebook.data.copy_(input_mean_per_embedding)
+            self.codebook.data = self.ema_input_sum_per_embedding / norm_cluster_size.unsqueeze(0)
+
+
+        avg_probs = nearest_codebook_indices_one_hot.float().mean(0)
+        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
 
         # use the one hot encodings for nearest vectors to get codebook vectors
         quantized = (nearest_codebook_indices_one_hot @ self.codebook.t()).view(inputs.shape)
@@ -108,6 +123,16 @@ class Quantizer(nn.Module):
         # straight through estimator
         quantized = inputs + (quantized - inputs).detach()
 
-        return quantized, commitment_loss
+        return quantized, commitment_loss, perplexity
 
 
+    def distance(self, flatten):
+        inputs_norm_sq = flatten.pow(2.).sum(dim=1, keepdim=True)
+        codebook_t_norm_sq = self.codebook.pow(2.).sum(dim=0, keepdim=True)
+        distances = torch.addmm(
+            inputs_norm_sq + codebook_t_norm_sq,
+            flatten,
+            self.codebook,
+            alpha=-2.0,
+        )
+        return distances

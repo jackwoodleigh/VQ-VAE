@@ -36,11 +36,11 @@ class SampleBlock(nn.Module):
         super().__init__()
         # -1 for down sample
         if scale_type == -1:
-            self.scale_block = nn.Conv2d(channels, channels, kernel_size=2, stride=2, padding=0)
+            self.scale_block = nn.Conv2d(channels, channels, kernel_size=4, stride=2, padding=1)
 
         # 1 for up sample
         elif scale_type == 1:
-            self.scale_block = nn.ConvTranspose2d(channels, channels, kernel_size=2, stride=2, padding=0)
+            self.scale_block = nn.ConvTranspose2d(channels, channels, kernel_size=4, stride=2, padding=1)
 
         # otherwise no sample
         else:
@@ -117,7 +117,7 @@ class ResBlock(nn.Module):
 
         self.sample_block = SampleBlock(out_channels, scale_type)
 
-        self.attention = MultiHeadSelfAttention(8, out_channels)
+        self.attention = MultiHeadSelfAttention(16, out_channels)
 
     def forward(self, x):
         residual = x
