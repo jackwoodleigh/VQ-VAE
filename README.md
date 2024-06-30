@@ -1,10 +1,10 @@
-### VQ-VAE
+## VQ-VAE
 
-##### Example
-3x128x128 -> 1x64x64 -> 3x128x128
+### Example
 ![](https://github.com/jackwoodleigh/VQ-VAE/blob/main/comparison.png)
+3x128x128 -> 1x64x64 -> 3x128x128
 
-##### References 
+### References 
 - https://arxiv.org/pdf/1711.00937
 - https://github.com/MishaLaskin/vqvae/tree/master
 - https://github.com/mattiasxu/VQVAE-2/tree/master
