@@ -1,6 +1,6 @@
 ## VQ-VAE
 
-### Example
+### Samples
 ![](https://github.com/jackwoodleigh/VQ-VAE/blob/main/comparison.png)
 3x128x128 -> 1x64x64 -> 3x128x128
 
