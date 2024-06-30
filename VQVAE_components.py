@@ -2,137 +2,140 @@ import math
 
 import torch
 from torch import nn
-from Blocks import ResLayerBuilder
+from Blocks import res_layer_builder, ResBlock, MultiHeadSelfAttention
 from torch.nn import functional as F
 
-class Block(nn.Module):
 
-    def __init__(self, block_type, d_model, block_structure, scale_structure, block_multiplier, in_channels=None, out_channels=None):
+class Encoder(nn.Module):
+    def __init__(self, d_model, in_channels, mid_channels, out_channels, res_structure, res_multiplier, scale_structure):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
 
-        # will always be reassigned for encoder and for decoders with optional input convs
-        previous = d_model * block_multiplier[-1]
+        self.input_conv = nn.Sequential(
+            nn.Conv2d(3, in_channels, kernel_size=3, padding=1)
+        )
 
-        # must define the input for encoder and output for decoder
-        assert (block_type == -1 and in_channels is not None) or (block_type == 1 and out_channels is not None)
+        self.layers = res_layer_builder(
+            block_type=-1,
+            previous_channels=in_channels,
+            d_model=d_model,
+            block_structure=res_structure,
+            block_multiplier=res_multiplier,
+            scale_structure=scale_structure
+        )
 
-        self.input_conv = nn.Identity()
-        # defines a convolution structure for all input channels
-        if in_channels is not None:
-            assert len(in_channels) > 1
-            self.input_conv = nn.Sequential()
+        self.mid_layers = nn.Sequential(
+            ResBlock(in_channels=d_model * res_multiplier[-1], out_channels=mid_channels),
+            MultiHeadSelfAttention(8, mid_channels),
+            ResBlock(in_channels=mid_channels, out_channels=mid_channels),
+            MultiHeadSelfAttention(8, mid_channels)
+        )
 
-            for i in range(len(in_channels) - 1):
-                self.input_conv.append(nn.Conv2d(in_channels[i], in_channels[i + 1], kernel_size=3, padding=1))
-
-            previous = in_channels[-1]
-
-        self.output_conv = nn.Identity()
-        # defines a convolution structure for all output channels
-        if out_channels is not None:
-            assert len(out_channels) > 1
-            self.output_conv = nn.Sequential()
-
-            for i in range(len(out_channels) - 1):
-                self.output_conv.append(nn.Conv2d(out_channels[i], out_channels[i + 1], kernel_size=3, padding=1))
-
-        # defines all resnet sub-blocks
-        self.layers = ResLayerBuilder(block_type, previous, d_model, block_structure, scale_structure, block_multiplier)
+        self.output_conv = nn.Sequential(
+            nn.GroupNorm(32, mid_channels),
+            nn.SiLU(),
+            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1)
+        )
 
     def forward(self, x):
         x = self.input_conv(x)
-        for module in self.layers:
-            x = module(x)
-        return self.output_conv(x)
+        x = self.layers(x)
+        x = self.mid_layers(x)
+        x = self.output_conv(x)
+        return x
 
- # https://github.com/lucidrains/vector-quantize-pytorch
- # https://github.com/kakaobrain/rq-vae-transformer/tree/main
+
+class Decoder(nn.Module):
+    def __init__(self, d_model, in_channels, mid_channels, out_channels, res_structure, res_multiplier, scale_structure):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+
+        self.input_conv = nn.Sequential(
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1)
+        )
+
+        self.mid_layers = nn.Sequential(
+            ResBlock(in_channels=mid_channels, out_channels=mid_channels),
+            MultiHeadSelfAttention(8, mid_channels),
+            ResBlock(in_channels=mid_channels, out_channels=mid_channels),
+            MultiHeadSelfAttention(8, mid_channels)
+        )
+
+        self.layers = res_layer_builder(
+            block_type=1,
+            previous_channels=mid_channels,
+            d_model=d_model,
+            block_structure=res_structure,
+            block_multiplier=res_multiplier,
+            scale_structure=scale_structure
+        )
+
+        output_in_channels = d_model * res_multiplier[0]
+        self.output_conv = nn.Sequential(
+            nn.GroupNorm(32, output_in_channels),
+            nn.SiLU(),
+            nn.Conv2d(output_in_channels, out_channels, kernel_size=3, padding=1),
+            nn.GroupNorm(32, out_channels),
+            nn.SiLU(),
+            nn.Conv2d(out_channels, 3, kernel_size=3, padding=1)
+        )
+
+    def forward(self, x):
+        x = self.input_conv(x)
+        x = self.mid_layers(x)
+        x = self.layers(x)
+        x = self.output_conv(x)
+        return x
+
+
+
+# https://github.com/lucidrains/vector-quantize-pytorch
+# https://github.com/kakaobrain/rq-vae-transformer/tree/main
 
 class Quantizer(nn.Module):
-    def __init__(self, num_embeddings, embeddings_dim, decay=0.9):
+    def __init__(self, num_embeddings, embeddings_dim, decay=0.99):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embeddings_dim = embeddings_dim
         self.decay = decay
-        self.eps = 1e-5
+        self.eps = 1e-6
 
-        self.register_buffer("codebook", torch.randn(embeddings_dim, num_embeddings))
-        self.register_buffer("ema_cluster_size", torch.zeros(self.num_embeddings))
-        self.register_buffer("ema_input_sum_per_embedding", self.codebook.clone())
+        self.codebook = nn.Embedding(self.num_embeddings, self.embeddings_dim)
+        self.codebook.weight.data.uniform_(-1.0 / self.num_embeddings, 1.0 / self.num_embeddings)
 
-        nn.init.uniform_(self.codebook, -1/self.num_embeddings, 1/self.num_embeddings)
-
-        self.cos = nn.CosineSimilarity(dim=-1, eps=1e-6)
-
-    def forward(self, inputs):
+    def forward(self, inputs, beta):
         # flatten input
+        inputs = inputs.permute(0, 2, 3, 1).contiguous()
         flatten = inputs.view(-1, self.embeddings_dim)
 
         # compute distance from encoder outputs to codebook vectors
-        '''l2_input = torch.sum(flatten.pow(2), dim=1, keepdim=True)
-        input_dot_codebook = flatten @ self.codebook
-        l2_codebook = torch.sum(self.codebook.pow(2), dim=0, keepdim=True)
-
-        distances = l2_input - 2 * input_dot_codebook + l2_codebook'''
-        distances = (
-                torch.sum(flatten ** 2, dim=1, keepdim=True)
-                - 2 * torch.matmul(flatten, self.codebook)
-                + torch.sum(self.codebook ** 2, dim=0, keepdim=True)
-        )
-
-        distances = self.distance(flatten)
+        d = self.distance(flatten)
 
         # finding the nearest codebook vector indices and one hot it
-        nearest_codebook_indices = torch.argmin(distances, dim=-1).unsqueeze(1)
-        nearest_codebook_indices_one_hot = F.one_hot(nearest_codebook_indices, self.num_embeddings).squeeze(1).type(
-            inputs.dtype)
-
-        # updating codebook vectors with EMA
-        if self.training:
-            # total number of uses for each embedding
-            nearest_codebook_indices_one_hot_sum = nearest_codebook_indices_one_hot.sum(dim=0)
-
-            # sum of encoder output vectors assigned to each codebook vector
-            input_sum_per_embedding = flatten.transpose(0, 1) @ nearest_codebook_indices_one_hot
-
-            # updating ema of cluster size
-            self.ema_cluster_size.data.mul_(self.decay).add_((1 - self.decay) * nearest_codebook_indices_one_hot_sum)
-            self.ema_input_sum_per_embedding.data.mul_(self.decay).add_((1 - self.decay) * input_sum_per_embedding)
-
-            # total size of all clusters
-            n = self.ema_cluster_size.sum()
-
-            # adds small number eps to all clusters for no division by 0
-            # normalizes cluster+eps by new total sum that includes eps
-            norm_cluster_size = ((self.ema_cluster_size + self.eps) / (n + self.num_embeddings * self.eps)) * n
-
-            # moving codebook clusters by mean
-            self.codebook.data = self.ema_input_sum_per_embedding / norm_cluster_size.unsqueeze(0)
-
-
-        avg_probs = nearest_codebook_indices_one_hot.float().mean(0)
-        perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
+        nearest_codebook_indices = torch.argmin(d, dim=1)
+        nearest_codebook_indices_one_hot = F.one_hot(nearest_codebook_indices, self.num_embeddings).type(inputs.dtype)
 
         # use the one hot encodings for nearest vectors to get codebook vectors
-        quantized = (nearest_codebook_indices_one_hot @ self.codebook.t()).view(inputs.shape)
+        quantized = torch.matmul(nearest_codebook_indices_one_hot, self.codebook.weight).view(inputs.shape)
 
-        commitment_loss = torch.mean((quantized.detach() - inputs).pow(2))
+        # loss
+        # I believe that this must be before straight through est. It took a lot of pain to figure that out
+        loss = torch.mean((quantized.detach() - inputs) ** 2) + beta * torch.mean((quantized - inputs.detach()) ** 2)
 
         # straight through estimator
-        quantized = inputs + (quantized - inputs).detach()
+        quantized = inputs + (quantized.detach() - inputs.detach())
 
-        return quantized, commitment_loss, perplexity
+        # perplexity
+        e_mean = torch.mean(nearest_codebook_indices_one_hot, dim=0)
+        perplexity = torch.exp(-torch.sum(e_mean * torch.log(e_mean + 1e-10)))
 
+        quantized = quantized.permute(0, 3, 1, 2).contiguous()
+
+        return loss, quantized, perplexity
 
     def distance(self, flatten):
-        inputs_norm_sq = flatten.pow(2.).sum(dim=1, keepdim=True)
-        codebook_t_norm_sq = self.codebook.pow(2.).sum(dim=0, keepdim=True)
-        distances = torch.addmm(
-            inputs_norm_sq + codebook_t_norm_sq,
-            flatten,
-            self.codebook,
-            alpha=-2.0,
-        )
-        return distances
+        d = torch.sum(flatten ** 2, dim=1, keepdim=True) + torch.sum(self.codebook.weight ** 2, dim=1) - 2 * torch.matmul(flatten, self.codebook.weight.t())
+        return d
+

@@ -3,9 +3,10 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-def ResLayerBuilder(block_type, previous_channels, d_model, block_structure, scale_structure, block_multiplier):
-    layers = nn.ModuleList()
-    scale_structure = [block_type * x for x in scale_structure]
+
+def res_layer_builder(block_type, previous_channels, d_model, block_structure, block_multiplier, scale_structure):
+    layers = []
+    scale_structure = [block_type*x for x in scale_structure]
 
     # is decoder
     if block_type == 1:
@@ -17,21 +18,31 @@ def ResLayerBuilder(block_type, previous_channels, d_model, block_structure, sca
         # follows chain of blocks
         struct = enumerate(block_structure)
 
+    # builds structure
     for i, count in struct:
+        temp = []
         current_channels = d_model * block_multiplier[i]
+
+        # add layers resblocks
         for block in range(count):
-            scale = 0
-
-            # for last block in sub layer attach the scale type
-            if block == count - 1:
-                scale = scale_structure[i]
-
-            layers.append(ResBlock(previous_channels, current_channels, scale_type=scale))
+            layers.append(ResBlock(previous_channels, current_channels))
             previous_channels = current_channels
 
-    return layers
+        # place up sample at the start
+        if scale_structure[i] == 1:
+            temp.insert(0, ScaleBlock(current_channels, scale_structure[i]))
 
-class SampleBlock(nn.Module):
+        # place down sample at the end
+        elif scale_structure[i] == -1:
+            temp.append(ScaleBlock(current_channels, scale_structure[i]))
+
+        temp.append(MultiHeadSelfAttention(8, current_channels))
+
+        layers.extend(temp)
+
+    return nn.Sequential(*layers)
+
+class ScaleBlock(nn.Module):
     def __init__(self, channels, scale_type=0):
         super().__init__()
         # -1 for down sample
@@ -84,21 +95,16 @@ class MultiHeadSelfAttention(nn.Module):
         return residual + self.ReZero_weight * output
 
 class ResBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, scale_type=0, dropout_rate=0.1):
+    def __init__(self, in_channels, out_channels, dropout_rate=0.1):
         super().__init__()
 
         self.block1 = nn.Sequential(
             nn.GroupNorm(32, in_channels),
             nn.SiLU(),
-        )
-
-        #self.sample_block = SampleBlock(in_channels, scale_type)
-
-        self.block2 = nn.Sequential(
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.GroupNorm(32, out_channels)
         )
-        self.block3 = nn.Sequential(
+        self.block2 = nn.Sequential(
+            nn.GroupNorm(32, out_channels),
             nn.SiLU(),
             nn.Dropout(dropout_rate),
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
@@ -110,26 +116,15 @@ class ResBlock(nn.Module):
         else:
             self.res_out_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
 
-        # residual sample type
-        self.res_sample_block = SampleBlock(out_channels, scale_type)
-
         self.ReZero_weight = nn.Parameter(torch.zeros(1))
-
-        self.sample_block = SampleBlock(out_channels, scale_type)
-
-        self.attention = MultiHeadSelfAttention(16, out_channels)
 
     def forward(self, x):
         residual = x
         x = self.block1(x)
         x = self.block2(x)
-        x = self.block3(x)
 
         # https://arxiv.org/pdf/2003.04887
         x = self.res_out_conv(residual) + self.ReZero_weight * x
-
-        x = self.attention(x)
-        x = self.sample_block(x)
 
         return x
 
@@ -142,6 +137,7 @@ class ResBlock(nn.Module):
 
         residual = self.res_out_conv(self.res_sample_block(residual))
         return residual + self.ReZero_weight * x
+
 
 
 

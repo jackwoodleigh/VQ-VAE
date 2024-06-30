@@ -1,57 +1,77 @@
 import torch
 from torch import nn
-from VQVAE_components import Block, Quantizer
+from VQVAE_components import Encoder, Decoder, Quantizer
+from torch.nn import functional as F
 from Blocks import ResBlock
 from sklearn.cluster import KMeans
 import numpy as np
 from torch.utils.data import Subset
-
+import math
 
 class VQVAE(nn.Module):
     def __init__(self, num_embeddings, embeddings_dim, beta, device="cuda"):
         super().__init__()
         self.device = device
         self.beta = beta
-        self.quantizer = Quantizer(num_embeddings, embeddings_dim)
+        self.quantizer = Quantizer(num_embeddings=num_embeddings, embeddings_dim=embeddings_dim)
+        self.encoder = Encoder(
+            d_model=64,
+            in_channels=32,
+            mid_channels=64,
+            out_channels=1,
+            res_structure=[2],
+            res_multiplier=[2],
+            scale_structure=[1]
+        )
 
-        self.encoder = Block(block_type=-1, in_channels=[3, 128], out_channels=[32, 1], d_model=32,
-                             block_structure=[1, 2, 1, 2, 1], scale_structure=[1, 0, 1, 0, 0],
-                             block_multiplier=[4, 4, 4, 4, 1])
-        self.decoder = Block(block_type=1, in_channels=[1, 32], out_channels=[128, 3], d_model=32,
-                             block_structure=[1, 2, 1, 2, 1], scale_structure=[1, 0, 1, 0, 0],
-                             block_multiplier=[4, 4, 4, 4, 1])
+        self.decoder = Decoder(
+            d_model=64,
+            in_channels=1,
+            mid_channels=64,
+            out_channels=32,
+            res_structure=[2],
+            res_multiplier=[2],
+            scale_structure=[1]
+        )
 
         self.loss = torch.nn.MSELoss()
+        self.commitment_weight = nn.Parameter(torch.zeros(1))
 
     def forward(self, images):
         self.train()
         x = self.encoder(images)
-        x, commitment_loss, perplexity = self.quantizer(x)
+        emb_loss, quantized, perplexity = self.quantizer(x, self.beta)
         pred_images = self.decoder(x)
 
         reconstruction_loss = self.loss(pred_images, images)
-        loss = reconstruction_loss + self.beta * commitment_loss
+        #commitment_weight = torch.clamp(self.commitment_weight, min=0.01, max=5.0)
+
+        loss = reconstruction_loss + emb_loss
 
         return pred_images, loss, perplexity
 
-    def k_means_init(self, training_loader, init_iters_count=100):
+    def k_means_init(self, training_loader, init_iters_count=50):
         latents = []
-        i=0
+        i = 0
         print("Initializing...")
         with torch.no_grad():
             for image, _ in training_loader:
+                print(i, end=" ")
                 image = image.to(self.device)
-                latents.append(self.encoder(image).to("cpu").numpy())
+                latents.append(self.encoder(image).to("cpu"))
                 i += 1
                 if i == init_iters_count:
                     break
 
-        latents = np.concatenate(latents, axis=0)
-        kmeans = KMeans(n_clusters=self.quantizer.num_embeddings)
-        kmeans.fit(latents.reshape(-1, self.quantizer.embeddings_dim))
+        latents = torch.cat(latents, dim=0)
+        latents = latents.view(-1, self.quantizer.embeddings_dim)
+        kmeans = KMeans(n_clusters=self.quantizer.num_embeddings, n_init=10)
+        kmeans.fit(latents.numpy())
 
-        self.quantizer.codebook.data = torch.from_numpy(kmeans.cluster_centers_.T).float().to(self.device)
+        centroids = torch.from_numpy(kmeans.cluster_centers_).float().to(self.device)
+        centroids = F.normalize(centroids, p=2, dim=1)
 
+        self.quantizer.codebook.weight = centroids.T
 
     def print_parameter_count(self):
         print(sum(p.numel() for p in self.parameters()))
@@ -62,12 +82,14 @@ class ModelHandler:
         self.device = device
         self.model = model
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate, betas=(0.9, 0.99), fused=True)
+        self.loss = torch.nn.MSELoss()
 
     def training(self, training_loader, epoch, total_batch_size=4):
         #self.model.k_means_init(training_loader)
         current_step = 0
         acc_loss = 0
         perplexity_avg = 0
+
         micro_batch_size = training_loader.batch_size
         macro_batch_size = 1
         if total_batch_size is not None:
@@ -80,8 +102,8 @@ class ModelHandler:
 
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                     pred_images, loss, perplexity = self.model(images)
+                    loss = loss / macro_batch_size
 
-                loss = loss / macro_batch_size
                 acc_loss += loss.detach()
                 perplexity_avg += perplexity / macro_batch_size
 

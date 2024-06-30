@@ -17,20 +17,18 @@ if __name__ == '__main__':
     training_set = Subset(training_set, subset_indices)'''
 
     training_loader = DataLoader(training_set, batch_size=32, shuffle=True, num_workers=8, pin_memory=True)
-
-    model = VQVAE(512, 64, 2.0).to("cuda")
-    helper = ModelHandler(model, learning_rate=0.00005)
+    model = VQVAE(512, 64, 0.1).to("cuda")
+    helper = ModelHandler(model, learning_rate=0.0003)
+    helper.load_model("model_save.pt")
     model.print_parameter_count()
-    #helper.load_model("model_save.pt")
 
-
-
-    helper.training(training_loader, 500, total_batch_size=128)
+    helper.training(training_loader, 500, total_batch_size=64)
 
     '''
     
+    
+    
     tensor1 = next(iter(training_loader))[0][10]
-    print(tensor1.shape)
     mean = torch.tensor([0.5, 0.5, 0.5]).view(3, 1, 1)
     std = torch.tensor([0.5, 0.5, 0.5]).view(3, 1, 1)
     tensor = tensor1 * std + mean
@@ -48,6 +46,7 @@ if __name__ == '__main__':
     x = torch.clamp(x, 0, 1)
     x = transform(x)
     x.save('output_image.png')
+    
 
     
     '''
