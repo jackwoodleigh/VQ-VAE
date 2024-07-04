@@ -3,7 +3,7 @@
 ### Samples
 ![](https://github.com/jackwoodleigh/VQ-VAE/blob/main/comparison.png)
 - 3x128x128 -> 1x64x64 -> 3x128x128
-- 10:1 compression ratio 
+- 12:1 compression ratio 
 
 ### References 
 - https://arxiv.org/pdf/1711.00937
