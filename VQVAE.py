@@ -3,10 +3,11 @@ from torch import nn
 from VQVAE_components import Encoder, Decoder, Quantizer
 from torch.nn import functional as F
 from Blocks import ResBlock
-from sklearn.cluster import KMeans
+from scipy.cluster.vq import kmeans2
 import numpy as np
 from torch.utils.data import Subset
 import math
+from tqdm import tqdm
 
 class VQVAE(nn.Module):
     def __init__(self, num_embeddings, embeddings_dim, beta, device="cuda"):
@@ -19,9 +20,9 @@ class VQVAE(nn.Module):
             in_channels=32,
             mid_channels=64,
             out_channels=1,
-            res_structure=[2],
-            res_multiplier=[2],
-            scale_structure=[1]
+            res_structure=[2, 2],
+            res_multiplier=[2, 4],
+            scale_structure=[1, 1]
         )
 
         self.decoder = Decoder(
@@ -29,18 +30,18 @@ class VQVAE(nn.Module):
             in_channels=1,
             mid_channels=64,
             out_channels=32,
-            res_structure=[2],
-            res_multiplier=[2],
-            scale_structure=[1]
+            res_structure=[2, 2],
+            res_multiplier=[2, 4],
+            scale_structure=[1, 1]
         )
 
         self.loss = torch.nn.MSELoss()
         self.commitment_weight = nn.Parameter(torch.zeros(1))
 
-    def forward(self, images):
+    def forward(self, images, replace_dead_codes):
         self.train()
         x = self.encoder(images)
-        emb_loss, quantized, perplexity = self.quantizer(x, self.beta)
+        emb_loss, quantized, perplexity = self.quantizer(x, self.beta, replace_dead_codes)
         pred_images = self.decoder(x)
 
         reconstruction_loss = self.loss(pred_images, images)
@@ -65,10 +66,9 @@ class VQVAE(nn.Module):
 
         latents = torch.cat(latents, dim=0)
         latents = latents.view(-1, self.quantizer.embeddings_dim)
-        kmeans = KMeans(n_clusters=self.quantizer.num_embeddings, n_init=10)
-        kmeans.fit(latents.numpy())
+        centroids, labels = kmeans2(latents.numpy(), self.quantizer.num_embeddings, minit='points')
 
-        centroids = torch.from_numpy(kmeans.cluster_centers_).float().to(self.device)
+        centroids = torch.tensor(centroids, dtype=self.quantizer.codebook.weight.dtype, device=self.quantizer.codebook.weight.device)
         centroids = F.normalize(centroids, p=2, dim=1)
 
         self.quantizer.codebook.weight = centroids.T
@@ -87,8 +87,6 @@ class ModelHandler:
     def training(self, training_loader, epoch, total_batch_size=4):
         #self.model.k_means_init(training_loader)
         current_step = 0
-        acc_loss = 0
-        perplexity_avg = 0
 
         micro_batch_size = training_loader.batch_size
         macro_batch_size = 1
@@ -97,11 +95,17 @@ class ModelHandler:
 
         for e in range(epoch):
             print(f"Epoch {e}")
-            for images, labels in training_loader:
+            acc_loss = 0
+            perplexity_avg = 0
+            for i, (images, labels) in tqdm(enumerate(training_loader)):
                 images = images.to(self.device)
 
+                replace_dead_codes = False
+                if i != 0 and i % 10 == 0:
+                    replace_dead_codes = True
+
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                    pred_images, loss, perplexity = self.model(images)
+                    pred_images, loss, perplexity = self.model(images, replace_dead_codes)
                     loss = loss / macro_batch_size
 
                 acc_loss += loss.detach()
@@ -112,14 +116,15 @@ class ModelHandler:
 
                 if current_step == macro_batch_size:
                     torch.cuda.synchronize()
-                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
-                    print(f"Accumulated loss: {acc_loss}, Perplexity: {perplexity_avg}")
+                    #torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                     self.optimizer.step()
                     self.optimizer.zero_grad()
-                    acc_loss = 0
-                    current_step = 0
-                    perplexity_avg = 0
 
+                    current_step = 0
+
+            print(f"Accumulated loss: {acc_loss / (len(training_loader) / macro_batch_size)}, Perplexity: {perplexity_avg / (len(training_loader) / macro_batch_size)}")
+            acc_loss = 0
+            perplexity_avg = 0
             self.save_model("model_save.pt")
 
     def save_model(self, path):
