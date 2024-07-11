@@ -19,7 +19,7 @@ if __name__ == '__main__':
 
     training_loader = DataLoader(training_set, batch_size=32, shuffle=True, num_workers=8, pin_memory=True)
     model = VQVAE(512, 32, 0.25).to("cuda")
-    helper = ModelHandler(model, learning_rate=0.0003)
+    helper = ModelHandler(model, learning_rate=0.0005)
     #helper.load_model("model_save.pt")
     model.print_parameter_count()
 

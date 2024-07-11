@@ -21,7 +21,7 @@ class VQVAE(nn.Module):
             mid_channels=64,
             out_channels=1,
             res_structure=[2, 2],
-            res_multiplier=[2, 4],
+            res_multiplier=[2, 2],
             scale_structure=[1, 1]
         )
 
@@ -31,7 +31,7 @@ class VQVAE(nn.Module):
             mid_channels=64,
             out_channels=32,
             res_structure=[2, 2],
-            res_multiplier=[2, 4],
+            res_multiplier=[2, 2],
             scale_structure=[1, 1]
         )
 
@@ -71,7 +71,9 @@ class VQVAE(nn.Module):
         centroids = torch.tensor(centroids, dtype=self.quantizer.codebook.weight.dtype, device=self.quantizer.codebook.weight.device)
         centroids = F.normalize(centroids, p=2, dim=1)
 
-        self.quantizer.codebook.weight = centroids.T
+        self.quantizer.codebook.weight = nn.Parameter(centroids)
+        self.quantizer.cluster_sizes = torch.ones_like(self.quantizer.cluster_sizes)*self.quantizer.dead_code_threshold
+        print()
 
     def print_parameter_count(self):
         print(sum(p.numel() for p in self.parameters()))
@@ -85,7 +87,7 @@ class ModelHandler:
         self.loss = torch.nn.MSELoss()
 
     def training(self, training_loader, epoch, total_batch_size=4):
-        #self.model.k_means_init(training_loader)
+        self.model.k_means_init(training_loader)
         current_step = 0
 
         micro_batch_size = training_loader.batch_size
@@ -95,13 +97,14 @@ class ModelHandler:
 
         for e in range(epoch):
             print(f"Epoch {e}")
+            self.optimizer.zero_grad()
             acc_loss = 0
             perplexity_avg = 0
             for i, (images, labels) in tqdm(enumerate(training_loader)):
                 images = images.to(self.device)
 
                 replace_dead_codes = False
-                if i != 0 and i % 10 == 0:
+                if i != 0 and i % 50 == 0:
                     replace_dead_codes = True
 
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16):

@@ -103,7 +103,7 @@ class Quantizer(nn.Module):
         self.decay = decay
         self.eps = 1e-6
         self.kld_scale = 10.0
-        self.dead_code_threshold = 2.0
+        self.dead_code_threshold = 1.0
 
         self.codebook = nn.Embedding(self.num_embeddings, self.embeddings_dim)
         self.codebook.weight.data.uniform_(-1.0 / self.num_embeddings, 1.0 / self.num_embeddings)
@@ -203,7 +203,7 @@ class Quantizer(nn.Module):
         new_codes_with_noise = new_codes + noise
         '''
 
-        new_codes = self.new_random_proximity_codes(new_centroids)
+        new_codes = self.new_localized_cluster_dispersing_codes(new_centroids)
 
         with torch.no_grad():
             self.codebook.weight.data[dead_codes_mask] = new_codes
@@ -211,27 +211,45 @@ class Quantizer(nn.Module):
         self.cluster_sizes[dead_codes_mask] = self.dead_code_threshold
         self.codebook_value_ema[dead_codes_mask] = new_codes * self.dead_code_threshold
 
+
     # creates new random codes within the proximity of the most used codes
     # the average distance between codes in the code book is used as proximity/magnitude
-    def new_random_proximity_codes(self, n):
-        _, top_indices = torch.topk(self.cluster_sizes.data, k=n, largest=True)
+    def new_localized_cluster_dispersing_codes(self, n):
+        top_sizes, top_indices = torch.topk(self.cluster_sizes.data, k=n, largest=True)
+        top_indices = self.size_proportional_new_cluster_assignments(top_sizes, top_indices)
 
-        # finds the average distance between codes
+        # finds the average distance between clusters
         distances = self.distance(self.codebook.weight)
-        distances = torch.mean(distances[distances > 0])
+        avg_distances = torch.mean(distances[distances > 0])
+
+        print(f"Number of new clusters: {n}, largest cluster: {top_sizes[0]}, avg distance: {avg_distances}")
 
         # creates random direction tensor with magnitude of 1
         direction = 2 * torch.randn(n, self.embeddings_dim, device=self.codebook.weight.device, dtype=self.codebook.weight.dtype) - 1
         norm_direction = torch.nn.functional.normalize(direction, p=2, dim=1)
 
-        # random scale value from 0.25 to 1
-        scale = 0.75 * torch.randn(n, device=self.codebook.weight.device, dtype=self.codebook.weight.dtype).unsqueeze(1) + 0.25
+        # random magnitude from 0.25 to 1. don't want new clusters to overlap with old
+        random_magnitude = 0.4 * torch.randn(n, device=self.codebook.weight.device, dtype=self.codebook.weight.dtype).unsqueeze(1) + 0.1
 
-        # scale noise by average distance between codes
-        shift = 2 * scale * distances * norm_direction
+        # offset used to create new clusters near large clusters
+        offset = random_magnitude * avg_distances * norm_direction
 
-        new_codes = self.codebook.weight[top_indices].detach() + shift
+        # essentially defines a high dimensional ring around large clusters where new clusters will spawn
+        new_codes = self.codebook.weight[top_indices].detach() + offset
 
         return new_codes
 
+    def size_proportional_new_cluster_assignments(self, usage_counts, top_indices):
+        size = len(top_indices)
 
+        norm = usage_counts.clone().detach() / sum(usage_counts.detach())
+        counts = torch.floor(norm * size).long()
+
+        i = 0
+        while counts.sum() < size:
+            counts[i] += 1
+            i += 1
+
+        indices = torch.repeat_interleave(torch.arange(len(counts), dtype=usage_counts.dtype, device=usage_counts.device), counts).long()
+        indices = top_indices[indices]
+        return indices
