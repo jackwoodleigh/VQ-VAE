@@ -15,12 +15,13 @@ class Encoder(nn.Module):
         self.out_channels = out_channels
 
         self.input_conv = nn.Sequential(
-            nn.Conv2d(3, in_channels, kernel_size=3, padding=1)
+            nn.Conv2d(3, 32, kernel_size=3, padding=1),
+            ResBlock(in_channels=32, out_channels=d_model * res_multiplier[0])
         )
 
         self.layers = res_layer_builder(
             block_type=-1,
-            previous_channels=in_channels,
+            previous_channels=d_model * res_multiplier[0],
             d_model=d_model,
             block_structure=res_structure,
             block_multiplier=res_multiplier,
@@ -28,16 +29,14 @@ class Encoder(nn.Module):
         )
 
         self.mid_layers = nn.Sequential(
-            ResBlock(in_channels=d_model * res_multiplier[-1], out_channels=mid_channels),
-            MultiHeadSelfAttention(8, mid_channels),
-            ResBlock(in_channels=mid_channels, out_channels=mid_channels),
-            MultiHeadSelfAttention(8, mid_channels)
+            ResBlock(in_channels=d_model * res_multiplier[-1], out_channels=8),
+            ResBlock(in_channels=8, out_channels=8),
+            ResBlock(in_channels=8, out_channels=8),
+            ResBlock(in_channels=8, out_channels=8),
         )
 
         self.output_conv = nn.Sequential(
-            nn.GroupNorm(32, mid_channels),
-            nn.SiLU(),
-            nn.Conv2d(mid_channels, out_channels, kernel_size=3, padding=1)
+            nn.Conv2d(8, 1, kernel_size=3, padding=1),
         )
 
     def forward(self, x):
@@ -55,19 +54,19 @@ class Decoder(nn.Module):
         self.out_channels = out_channels
 
         self.input_conv = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1)
+            nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1),
         )
 
         self.mid_layers = nn.Sequential(
             ResBlock(in_channels=mid_channels, out_channels=mid_channels),
-            MultiHeadSelfAttention(8, mid_channels),
             ResBlock(in_channels=mid_channels, out_channels=mid_channels),
-            MultiHeadSelfAttention(8, mid_channels)
+            ResBlock(in_channels=mid_channels, out_channels=mid_channels),
+            ResBlock(in_channels=mid_channels, out_channels=d_model * res_multiplier[-1]),
         )
 
         self.layers = res_layer_builder(
             block_type=1,
-            previous_channels=mid_channels,
+            previous_channels=d_model * res_multiplier[-1],
             d_model=d_model,
             block_structure=res_structure,
             block_multiplier=res_multiplier,
@@ -76,12 +75,13 @@ class Decoder(nn.Module):
 
         output_in_channels = d_model * res_multiplier[0]
         self.output_conv = nn.Sequential(
-            nn.GroupNorm(32, output_in_channels),
+            ResBlock(in_channels=output_in_channels, out_channels=64),
+            nn.GroupNorm(8, 64),
             nn.SiLU(),
-            nn.Conv2d(output_in_channels, out_channels, kernel_size=3, padding=1),
-            nn.GroupNorm(32, out_channels),
+            nn.Conv2d(64, 16, kernel_size=3, padding=1),
+            nn.GroupNorm(8, 16),
             nn.SiLU(),
-            nn.Conv2d(out_channels, 3, kernel_size=3, padding=1)
+            nn.Conv2d(16, 3, kernel_size=3, padding=1)
         )
 
     def forward(self, x):
@@ -103,15 +103,17 @@ class Quantizer(nn.Module):
         self.decay = decay
         self.eps = 1e-6
         self.kld_scale = 10.0
-        self.dead_code_threshold = 1.0
+        self.dead_code_threshold = 0.25
 
         self.codebook = nn.Embedding(self.num_embeddings, self.embeddings_dim)
-        self.codebook.weight.data.uniform_(-1.0 / self.num_embeddings, 1.0 / self.num_embeddings)
+        self.codebook.weight.data.uniform_(-100.0 / self.num_embeddings, 100.0 / self.num_embeddings)
 
         self.register_buffer("cluster_sizes", torch.zeros(self.num_embeddings))
         self.register_buffer("codebook_value_ema", self.codebook.weight.clone())
+        self.register_buffer('data_initialized', torch.zeros(1))
 
     def forward(self, inputs, beta, replace_dead_codes=False, ema=False):
+        dtype = inputs.dtype
         # flatten input
         inputs = inputs.permute(0, 2, 3, 1).contiguous()
         flatten = inputs.view(-1, self.embeddings_dim)
@@ -122,10 +124,10 @@ class Quantizer(nn.Module):
         # finding the nearest codebook vector indices
         nearest_codebook_indices = torch.argmin(d, dim=1)
         # one hot indices (num_input_vec, num_embeddings)
-        nearest_codebook_indices_one_hot = F.one_hot(nearest_codebook_indices, self.num_embeddings).type(inputs.dtype)
+        nearest_codebook_indices_one_hot = F.one_hot(nearest_codebook_indices, self.num_embeddings).to(dtype=dtype)
 
         # use the one hot encodings for nearest vectors to get codebook vectors
-        quantized = torch.matmul(nearest_codebook_indices_one_hot, self.codebook.weight).view(inputs.shape)
+        quantized = torch.matmul(nearest_codebook_indices_one_hot, self.codebook.weight.to(dtype=dtype)).view(inputs.shape)
 
         loss = None
         if self.training:
@@ -161,7 +163,8 @@ class Quantizer(nn.Module):
         return loss, quantized, perplexity
 
     def distance(self, flatten):
-        d = torch.sum(flatten ** 2, dim=1, keepdim=True) + torch.sum(self.codebook.weight ** 2, dim=1) - 2 * torch.matmul(flatten, self.codebook.weight.t())
+        d = flatten.pow(2).sum(1, keepdim=True) - 2 * flatten @ self.codebook.weight.t() + self.codebook.weight.pow(2).sum(1, keepdim=True).t()
+        #d = torch.sum(flatten ** 2, dim=1, keepdim=True) + torch.sum(self.codebook.weight ** 2, dim=1) - 2 * torch.matmul(flatten, self.codebook.weight.t())
         return d
 
     # https://github.com/rosinality/vq-vae-2-pytorch/blob/master/vqvae.py
@@ -220,16 +223,18 @@ class Quantizer(nn.Module):
 
         # finds the average distance between clusters
         distances = self.distance(self.codebook.weight)
-        avg_distances = torch.mean(distances[distances > 0])
+        # find the distance to vectors in close-proximity
+        closest_values, closest_indices = torch.topk(distances, k=10, dim=1, largest=False)
+        avg_distances = torch.mean(closest_values, dim=1)[top_indices].unsqueeze(1)
 
-        print(f"Number of new clusters: {n}, largest cluster: {top_sizes[0]}, avg distance: {avg_distances}")
+        print(f"Number of new clusters: {n}, largest cluster: {top_sizes[0]}, avg distance: {avg_distances.mean()}")
 
         # creates random direction tensor with magnitude of 1
         direction = 2 * torch.randn(n, self.embeddings_dim, device=self.codebook.weight.device, dtype=self.codebook.weight.dtype) - 1
         norm_direction = torch.nn.functional.normalize(direction, p=2, dim=1)
 
         # random magnitude from 0.25 to 1. don't want new clusters to overlap with old
-        random_magnitude = 0.4 * torch.randn(n, device=self.codebook.weight.device, dtype=self.codebook.weight.dtype).unsqueeze(1) + 0.1
+        random_magnitude = 0.65 * torch.randn(n, device=self.codebook.weight.device, dtype=self.codebook.weight.dtype).unsqueeze(1) + 0.1
 
         # offset used to create new clusters near large clusters
         offset = random_magnitude * avg_distances * norm_direction
